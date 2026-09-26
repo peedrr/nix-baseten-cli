@@ -1,0 +1,169 @@
+---
+name: Update Baseten
+
+'on':
+  schedule:
+    # Hourly at minute 7.
+    - cron: '7 * * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional version override (e.g. 1.0.0 or v1.0.0)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-baseten
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Run update script
+        id: update-script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_OVERRIDE: ${{ github.event.inputs.version || '' }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/update-baseten.sh
+
+      - name: Refresh flake inputs when stale
+        # Refresh flake.lock alongside a baseten update, or when the lock is
+        # older than 7 days, to avoid hourly nixpkgs churn.
+        run: |
+          set -euo pipefail
+
+          lock_age_days=999
+          if git log -1 --format=%ct -- flake.lock | grep -qE '^[0-9]+$'; then
+            lock_ts="$(git log -1 --format=%ct -- flake.lock)"
+            now_ts="$(date +%s)"
+            lock_age_days=$(( (now_ts - lock_ts) / 86400 ))
+          fi
+
+          if [[ "${UPDATE_REQUIRED:-false}" == "true" ]] \
+            || [[ "${lock_age_days}" -ge 7 ]]; then
+            echo "Updating flake inputs (lock age: ${lock_age_days} days)..."
+            nix flake update
+          else
+            echo "flake.lock is ${lock_age_days}d old, no update; skipping."
+          fi
+
+      - name: Check for changes
+        id: changes
+        run: |
+          set -euo pipefail
+
+          if [[ "${UPDATE_REQUIRED:-false}" == "true" ]]; then
+            echo "baseten_updated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "baseten_updated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git diff --quiet -- flake.lock; then
+            echo "flake_lock_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "flake_lock_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git diff --quiet; then
+            echo "any_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "any_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build verification
+        if: steps.changes.outputs.any_changes == 'true'
+        run: |
+          set -euo pipefail
+          nix build .#baseten --no-link --print-out-paths > store-path.txt
+          version_out="$(cat store-path.txt)/bin/baseten --version"
+          ${version_out}
+          if [[ "${UPDATE_REQUIRED:-false}" == "true" ]]; then
+            ${version_out} | grep -F "${NEW_VERSION}"
+          fi
+
+      - name: Prepare PR metadata
+        if: steps.changes.outputs.any_changes == 'true'
+        id: pr-meta
+        run: |
+          set -euo pipefail
+
+          if [[ "${UPDATE_REQUIRED:-false}" == "true" ]]; then
+            title="chore: update baseten to v${NEW_VERSION}"
+            commit_message="chore: update baseten to v${NEW_VERSION}"
+          else
+            title="chore: update flake inputs"
+            commit_message="chore: update flake inputs"
+          fi
+
+          releases="https://github.com/basetenlabs/baseten-cli/releases"
+          body="Automated update by \`.github/workflows/update-baseten.yml\`."
+          body+=$'\n\n'
+
+          if [[ "${UPDATE_REQUIRED:-false}" == "true" ]]; then
+            body+="**Baseten update:** v${NEW_VERSION}"$'\n'
+            body+="- Updated \`packages/baseten/sources.json\`"$'\n'
+            body+="- Hashes verified against upstream \`checksums.txt\`"$'\n'
+            body+="- Release notes: ${releases}/tag/v${NEW_VERSION}"$'\n'
+          fi
+
+          lock_changed="${{ steps.changes.outputs.flake_lock_changed }}"
+          if [[ "${lock_changed}" == "true" ]]; then
+            body+="- Updated \`flake.lock\` (nixpkgs)"$'\n'
+          fi
+
+          echo "title=${title}" >> "$GITHUB_OUTPUT"
+          echo "commit_message=${commit_message}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo 'body<<EOF'
+            echo "${body}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or update pull request
+        if: steps.changes.outputs.any_changes == 'true'
+        id: cpr
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.BASETEN_UPDATER_TOKEN || secrets.GITHUB_TOKEN }}
+          commit-message: ${{ steps.pr-meta.outputs.commit_message }}
+          branch: automation/update-baseten
+          delete-branch: true
+          title: ${{ steps.pr-meta.outputs.title }}
+          body: ${{ steps.pr-meta.outputs.body }}
+
+      - name: Enable auto-merge
+        if: steps.cpr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ secrets.BASETEN_UPDATER_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr merge "${{ steps.cpr.outputs.pull-request-number }}" \
+            --squash --auto || true
+
+      - name: Merge pull request
+        if: steps.cpr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ secrets.BASETEN_UPDATER_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr merge "${{ steps.cpr.outputs.pull-request-number }}" \
+            --squash --admin
