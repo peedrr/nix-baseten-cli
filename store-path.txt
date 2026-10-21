@@ -1,1 +1,1 @@
-/nix/store/w4cckjm0rs9csfr8g9a6hxasjb5izcvn-baseten-1.4.0
+/nix/store/707hs9vw39z3w9ds9b1k15r8an9y8wwh-baseten-1.4.1
